@@ -1,0 +1,5 @@
+{
+  "name": "Lorebook Maker",
+  "description": "A powerful tool to create, edit, and expand JSON lorebooks using Google Gemini AI or Custom APIs.",
+  "requestFramePermissions": []
+}
