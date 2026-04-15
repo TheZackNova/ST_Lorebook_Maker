@@ -218,11 +218,22 @@ const App: React.FC = () => {
   const [customApiKey, setCustomApiKey] = useState<string>(() => 
     localStorage.getItem('lorebook_custom_key') || ''
   );
-  const [customModels, setCustomModels] = useState<string[]>([]);
+  const [customModels, setCustomModels] = useState<string[]>(() => {
+    try {
+      const saved = localStorage.getItem('lorebook_custom_models');
+      return saved ? JSON.parse(saved) : [];
+    } catch { return []; }
+  });
   const [selectedCustomModel, setSelectedCustomModel] = useState<string>(() => 
     localStorage.getItem('lorebook_custom_model') || ''
   );
-  const [isApiConnected, setIsApiConnected] = useState<boolean>(false);
+  const [isApiConnected, setIsApiConnected] = useState<boolean>(() => {
+    try {
+      const saved = localStorage.getItem('lorebook_custom_models');
+      const models = saved ? JSON.parse(saved) : [];
+      return models.length > 0;
+    } catch { return false; }
+  });
   const [isConnecting, setIsConnecting] = useState<boolean>(false);
 
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -245,6 +256,13 @@ const App: React.FC = () => {
   useEffect(() => {
     localStorage.setItem('lorebook_api_provider', apiProvider);
   }, [apiProvider]);
+
+  // Save Custom Models
+  useEffect(() => {
+    if (customModels.length > 0) {
+      localStorage.setItem('lorebook_custom_models', JSON.stringify(customModels));
+    }
+  }, [customModels]);
 
   // Save Custom API Settings (Debounced)
   useEffect(() => {
