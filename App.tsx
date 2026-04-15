@@ -41,6 +41,78 @@ const DEFAULT_ENTRY_TEMPLATE: LorebookEntry = {
   displayIndex: 0
 };
 
+const MIN_API_EXTRACT_LENGTH = 100;
+const MIN_PROXY_HTML_LENGTH = 100;
+const MIN_SCRAPED_TEXT_LENGTH = 50;
+const MAX_SCRAPED_TEXT_LENGTH = 50000;
+const NOISE_ELEMENTS_SELECTOR =
+  'script,style,nav,.navbox,.toc,.mw-editsection,.reference,.reflist,[class*="ad-"],[id*="ad-"]';
+
+// Helper: Parse Fandom/MediaWiki URL → base + page title
+const parseFandomUrl = (url: string): { apiBase: string; pageTitle: string } | null => {
+  try {
+    const u = new URL(url);
+    const apiBase = `${u.protocol}//${u.host}/api.php`;
+    const pageTitle = decodeURIComponent(u.pathname.replace(/^\/wiki\//, ''));
+    if (!pageTitle) return null;
+    return { apiBase, pageTitle };
+  } catch {
+    return null;
+  }
+};
+
+// Helper: Fetch structured text — MediaWiki API first, proxy fallback
+const fetchWikiText = async (scrapeUrl: string): Promise<string> => {
+  const parsed = parseFandomUrl(scrapeUrl);
+
+  // Strategy 1: MediaWiki/Fandom official API (no proxy needed, CORS allowed)
+  if (parsed) {
+    const { apiBase, pageTitle } = parsed;
+    const params = new URLSearchParams({
+      action: 'query',
+      titles: pageTitle,
+      prop: 'extracts',
+      exintro: '0',
+      explaintext: '1',
+      redirects: '1',
+      format: 'json',
+      origin: '*',
+    });
+    try {
+      const res = await fetch(`${apiBase}?${params}`);
+      if (res.ok) {
+        const data = await res.json();
+        const pages = data.query?.pages || {};
+        const page = Object.values(pages)[0] as any;
+        if (page && !page.missing && page.extract && page.extract.length > MIN_API_EXTRACT_LENGTH) {
+          return page.extract.substring(0, MAX_SCRAPED_TEXT_LENGTH);
+        }
+      }
+    } catch {
+      // fall through to proxy
+    }
+  }
+
+  // Strategy 2: allorigins.win proxy fallback
+  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(scrapeUrl)}`;
+  const res2 = await fetch(proxyUrl);
+  if (!res2.ok) throw new Error('Không thể tải nội dung từ URL này.');
+  const data2 = await res2.json();
+  const html = data2.contents || '';
+  if (!html || html.trim().length < MIN_PROXY_HTML_LENGTH) throw new Error('Nội dung trống hoặc không tải được.');
+
+  const doc = new DOMParser().parseFromString(html, 'text/html');
+  const main =
+    doc.querySelector('.mw-parser-output') ||
+    doc.querySelector('#mw-content-text') ||
+    doc.querySelector('article') ||
+    doc.body;
+  main.querySelectorAll(NOISE_ELEMENTS_SELECTOR).forEach((n) => n.remove());
+  const text = (main.textContent || '').replace(/\s+/g, ' ').trim();
+  if (text.length < MIN_SCRAPED_TEXT_LENGTH) throw new Error('Nội dung quá ít để xử lý. Trang có thể yêu cầu JavaScript.');
+  return text.substring(0, MAX_SCRAPED_TEXT_LENGTH);
+};
+
 const App: React.FC = () => {
   // --- Data State ---
   const [lorebook, setLorebook] = useState<Lorebook>({ entries: {} });
@@ -462,60 +534,39 @@ const App: React.FC = () => {
 
   const handleScrapeGenerate = async () => {
     if (!scrapeUrl.trim()) return;
-    if (apiProvider === 'custom' && !isApiConnected) return setErrorMsg("Connect to Custom API first");
-    
+    if (apiProvider === 'custom' && !isApiConnected) return setErrorMsg('Connect to Custom API first');
+
     setIsScrapeModalOpen(false);
     setStatus(AppStatus.GENERATING);
     setErrorMsg(null);
     setIsScraping(true);
 
     try {
-      // 1. Fetch URL via CORS proxy
-      const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(scrapeUrl)}`;
-      const response = await fetch(proxyUrl);
-      if (!response.ok) throw new Error("Failed to fetch URL");
-      const data = await response.json();
-      const html = data.contents;
+      // 1. Fetch content — MediaWiki API first, proxy fallback
+      const scrapedText = await fetchWikiText(scrapeUrl);
 
-      // 2. Extract text from HTML
-      const parser = new DOMParser();
-      const doc = parser.parseFromString(html, "text/html");
-      
-      // Try to find the main content area to avoid scraping menus/footers
-      const mainContent = doc.querySelector('#mw-content-text') || doc.body;
-      
-      // Remove scripts and styles
-      const scripts = mainContent.querySelectorAll('script, style');
-      scripts.forEach(s => s.remove());
-
-      let scrapedText = mainContent.textContent || "";
-      // Clean up text
-      scrapedText = scrapedText.replace(/\s+/g, ' ').trim();
-      
-      // Truncate if too long (Gemini 1.5 Flash has a large context window, but just in case)
-      if (scrapedText.length > 50000) {
-        scrapedText = scrapedText.substring(0, 50000);
-      }
+      // 2. Compute newUid synchronously from current lorebook state (fix closure bug)
+      const entriesVal = Object.values(lorebook.entries) as LorebookEntry[];
+      const uids = entriesVal.map((e) => e.uid);
+      const newUid = uids.length > 0 ? Math.max(...uids) + 1 : 0;
 
       // 3. Create placeholder entry
-      let newUid = 0;
-      setLorebook(prev => {
-        const entriesVal = Object.values(prev.entries) as LorebookEntry[];
-        const uids = entriesVal.map(e => e.uid);
-        newUid = uids.length > 0 ? Math.max(...uids) + 1 : 0;
-        
-        const newEntry: LorebookEntry = {
-           ...DEFAULT_ENTRY_TEMPLATE,
-           uid: newUid,
-           displayIndex: newUid,
-           comment: `Scraping: ${scrapeUrl}...`,
-           content: "Đang xử lý dữ liệu từ URL..."
-        };
-        return { ...prev, entries: { ...prev.entries, [newUid]: newEntry } };
-      });
+      setLorebook((prev) => ({
+        ...prev,
+        entries: {
+          ...prev.entries,
+          [newUid]: {
+            ...DEFAULT_ENTRY_TEMPLATE,
+            uid: newUid,
+            displayIndex: newUid,
+            comment: `Scraping: ${scrapeUrl}...`,
+            content: 'Đang xử lý dữ liệu từ URL...',
+          },
+        },
+      }));
       setSelectedUid(newUid);
 
-      // 4. Generate content
+      // 4. Prepare generation config
       const config = getApiConfig();
       let mode: GenerationMode = 'brief';
       let customTemplateContent: string | undefined = undefined;
@@ -523,7 +574,7 @@ const App: React.FC = () => {
       if (selectedTemplateId === 'detailed') mode = 'detailed';
       else if (selectedTemplateId === 'brief') mode = 'brief';
       else {
-        const found = customTemplates.find(t => t.id === selectedTemplateId);
+        const found = customTemplates.find((t) => t.id === selectedTemplateId);
         if (found) customTemplateContent = found.content;
       }
 
@@ -535,45 +586,51 @@ URL: ${scrapeUrl}
 ${scrapedText}
 ---KẾT THÚC NỘI DUNG---`;
 
+      // 5. Generate AI content with streaming
       const result = await generateLorebookEntry(
-          prompt, 
-          config, 
-          mode, 
-          customTemplateContent,
-          (streamedText) => {
-               setLorebook(prev => ({
-                  ...prev,
-                  entries: {
-                      ...prev.entries,
-                      [newUid]: {
-                          ...prev.entries[newUid],
-                          content: streamedText
-                      }
-                  }
-               }));
-          }
+        prompt,
+        config,
+        mode,
+        customTemplateContent,
+        (streamedText) => {
+          setLorebook((prev) => ({
+            ...prev,
+            entries: {
+              ...prev.entries,
+              [newUid]: {
+                ...prev.entries[newUid],
+                content: streamedText,
+              },
+            },
+          }));
+        }
       );
 
-      // 5. Update entry with final clean data
+      // 6. Update entry with final parsed data
       if (result) {
-         setLorebook(prev => {
-           const entry = prev.entries[newUid];
-           if(!entry) return prev;
-           return {
-             ...prev,
-             entries: {
-               ...prev.entries,
-               [newUid]: {
-                 ...entry,
-                 comment: result.comment && result.comment !== "Generated Character" ? result.comment : "Scraped Character",
-                 key: result.key && result.key.length > 0 ? result.key : ["Scraped Character"],
-                 content: result.content || "Failed to generate content"
-               }
-             }
-           }
-         });
+        setLorebook((prev) => {
+          const entry = prev.entries[newUid];
+          if (!entry) return prev;
+          return {
+            ...prev,
+            entries: {
+              ...prev.entries,
+              [newUid]: {
+                ...entry,
+                comment:
+                  result.comment && result.comment !== 'Generated Character'
+                    ? result.comment
+                    : 'Scraped Character',
+                key:
+                  result.key && result.key.length > 0
+                    ? result.key
+                    : ['Scraped Character'],
+                content: result.content || 'Failed to generate content',
+              },
+            },
+          };
+        });
       }
-
     } catch (e: any) {
       setErrorMsg(`Scrape Error: ${e.message}`);
     } finally {
