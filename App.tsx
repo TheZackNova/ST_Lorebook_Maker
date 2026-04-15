@@ -527,7 +527,13 @@ const App: React.FC = () => {
         if (found) customTemplateContent = found.content;
       }
 
-      const prompt = `Dựa vào thông tin được trích xuất từ Wiki sau đây, hãy tạo hồ sơ nhân vật. Nếu thông tin không đủ, hãy tự sáng tạo thêm cho phù hợp với ngữ cảnh.\n\nNguồn URL: ${scrapeUrl}\n\nNội dung trích xuất:\n${scrapedText}`;
+      const prompt = `Dựa vào thông tin được trích xuất từ Wiki sau đây, hãy tạo hồ sơ nhân vật. Nếu thông tin không đủ, hãy tự sáng tạo thêm cho phù hợp.
+
+URL: ${scrapeUrl}
+
+---NỘI DUNG WIKI---
+${scrapedText}
+---KẾT THÚC NỘI DUNG---`;
 
       const result = await generateLorebookEntry(
           prompt, 
