@@ -61,24 +61,26 @@ const parseFandomUrl = (url: string): { apiBase: string; pageTitle: string } | n
   }
 };
 
-// Helper: Fetch structured text — MediaWiki API first, proxy fallback
+// Helper: Fetch structured text — MediaWiki API first (query→parse), proxy fallback
 const fetchWikiText = async (scrapeUrl: string): Promise<string> => {
   const parsed = parseFandomUrl(scrapeUrl);
 
   // Strategy 1: MediaWiki/Fandom official API (no proxy needed, CORS allowed)
   if (parsed) {
     const { apiBase, pageTitle } = parsed;
-    const params = new URLSearchParams({
-      action: 'query',
-      titles: pageTitle,
-      prop: 'extracts',
-      exintro: '0',
-      explaintext: '1',
-      redirects: '1',
-      format: 'json',
-      origin: '*',
-    });
+
+    // Strategy 1a: TextExtracts extension (standard MediaWiki / Wikipedia)
     try {
+      const params = new URLSearchParams({
+        action: 'query',
+        titles: pageTitle,
+        prop: 'extracts',
+        exintro: '0',
+        explaintext: '1',
+        redirects: '1',
+        format: 'json',
+        origin: '*',
+      });
       const res = await fetch(`${apiBase}?${params}`);
       if (res.ok) {
         const data = await res.json();
@@ -86,6 +88,53 @@ const fetchWikiText = async (scrapeUrl: string): Promise<string> => {
         const page = Object.values(pages)[0] as any;
         if (page && !page.missing && page.extract && page.extract.length > MIN_API_EXTRACT_LENGTH) {
           return page.extract.substring(0, MAX_SCRAPED_TEXT_LENGTH);
+        }
+      }
+    } catch {
+      // fall through to 1b
+    }
+
+    // Strategy 1b: action=parse with wikitext (Fandom and wikis without TextExtracts)
+    try {
+      const parseParams = new URLSearchParams({
+        action: 'parse',
+        page: pageTitle,
+        prop: 'wikitext',
+        redirects: '1',
+        format: 'json',
+        origin: '*',
+      });
+      const parseRes = await fetch(`${apiBase}?${parseParams}`);
+      if (parseRes.ok) {
+        const parseData = await parseRes.json();
+        const wikitext: string = parseData.parse?.wikitext?.['*'] || '';
+        if (wikitext.length > MIN_API_EXTRACT_LENGTH) {
+          // Iteratively remove {{templates}} until fully resolved (handles deep nesting, capped for safety)
+          let t = wikitext;
+          let prev: string;
+          let iterations = 0;
+          do {
+            prev = t;
+            t = t.replace(/\{\{[^{}]*\}\}/g, '');
+            iterations++;
+          } while (t !== prev && iterations < 20);
+          const cleanText = new DOMParser()
+            .parseFromString(
+              t
+                .replace(/\[\[(?:[^|\]]*\|)?([^\]]*)\]\]/g, '$1')      // [[link|text]] → text
+                .replace(/\[\[[^\]]*\]\]/g, '')                          // remove remaining [[links]]
+                .replace(/'{2,3}/g, '')                                  // remove ''italic'', '''bold'''
+                .replace(/<ref[^>]*\/>/g, '')                            // remove self-closing <ref />
+                .replace(/<ref[^>]*>[\s\S]*?<\/ref>/g, '')               // remove <ref>...</ref>
+                .replace(/==+\s*([^=]+?)\s*==+/g, '\n\n$1:\n')          // == Heading == → Heading:
+                .replace(/^[ \t]*\|[^\n]*/gm, '')                        // remove infobox/table pipe rows
+                .replace(/\[https?:\/\/[^\s\]]*(?:\s+([^\]]*))?\]/g, '$1'), // [url text] → text
+              'text/html'
+            )
+            .body.textContent?.replace(/\s+/g, ' ').trim() ?? '';
+          if (cleanText.length > MIN_API_EXTRACT_LENGTH) {
+            return cleanText.substring(0, MAX_SCRAPED_TEXT_LENGTH);
+          }
         }
       }
     } catch {
@@ -106,10 +155,18 @@ const fetchWikiText = async (scrapeUrl: string): Promise<string> => {
     doc.querySelector('.mw-parser-output') ||
     doc.querySelector('#mw-content-text') ||
     doc.querySelector('article') ||
+    doc.querySelector('main') ||
+    doc.querySelector('#content') ||
+    doc.querySelector('.content') ||
+    doc.querySelector('[role="main"]') ||
     doc.body;
   main.querySelectorAll(NOISE_ELEMENTS_SELECTOR).forEach((n) => n.remove());
   const text = (main.textContent || '').replace(/\s+/g, ' ').trim();
-  if (text.length < MIN_SCRAPED_TEXT_LENGTH) throw new Error('Nội dung quá ít để xử lý. Trang có thể yêu cầu JavaScript.');
+  if (text.length < MIN_SCRAPED_TEXT_LENGTH)
+    throw new Error(
+      'Nội dung quá ít để xử lý. Trang có thể yêu cầu JavaScript. ' +
+      'Hãy thử URL từ wiki.fandom.com hoặc nhập thông tin thủ công vào ô Prompt.'
+    );
   return text.substring(0, MAX_SCRAPED_TEXT_LENGTH);
 };
 
