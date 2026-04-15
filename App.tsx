@@ -816,7 +816,7 @@ ${scrapedText}
     setFandomSearchQuery("");
     try {
       const links = await fetchFandomCategoryLinks(fandomCategoryUrl);
-      if (links.length === 0) throw new Error("Không tìm thấy nhân vật nào trong danh mục này.");
+      if (links.length === 0) throw new Error("No characters found in this category.");
       setFandomCharacterLinks(links);
       setFandomStep('select');
     } catch (e: any) {
@@ -917,7 +917,7 @@ ${scrapedText}
           });
         }
       } catch (e: any) {
-        setErrorMsg(`Lỗi khi xử lý ${link.name}: ${e.message}`);
+        setErrorMsg(`Error processing ${link.name}: ${e.message}`);
         await new Promise(r => setTimeout(r, 1000));
       }
     }
