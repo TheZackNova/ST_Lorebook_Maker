@@ -74,6 +74,11 @@ const App: React.FC = () => {
   const [batchWorld, setBatchWorld] = useState("");
   const [batchQuantity, setBatchQuantity] = useState(5);
 
+  // --- Scrape State ---
+  const [isScrapeModalOpen, setIsScrapeModalOpen] = useState(false);
+  const [scrapeUrl, setScrapeUrl] = useState("");
+  const [isScraping, setIsScraping] = useState(false);
+
   // --- API Configuration State (Persistent) ---
   const [apiProvider, setApiProvider] = useState<ApiProvider>(() => 
     (localStorage.getItem('lorebook_api_provider') as ApiProvider) || 'gemini'
@@ -455,6 +460,122 @@ const App: React.FC = () => {
     }
   };
 
+  const handleScrapeGenerate = async () => {
+    if (!scrapeUrl.trim()) return;
+    if (apiProvider === 'custom' && !isApiConnected) return setErrorMsg("Connect to Custom API first");
+    
+    setIsScrapeModalOpen(false);
+    setStatus(AppStatus.GENERATING);
+    setErrorMsg(null);
+    setIsScraping(true);
+
+    try {
+      // 1. Fetch URL via CORS proxy
+      const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(scrapeUrl)}`;
+      const response = await fetch(proxyUrl);
+      if (!response.ok) throw new Error("Failed to fetch URL");
+      const data = await response.json();
+      const html = data.contents;
+
+      // 2. Extract text from HTML
+      const parser = new DOMParser();
+      const doc = parser.parseFromString(html, "text/html");
+      
+      // Try to find the main content area to avoid scraping menus/footers
+      const mainContent = doc.querySelector('#mw-content-text') || doc.body;
+      
+      // Remove scripts and styles
+      const scripts = mainContent.querySelectorAll('script, style');
+      scripts.forEach(s => s.remove());
+
+      let scrapedText = mainContent.textContent || "";
+      // Clean up text
+      scrapedText = scrapedText.replace(/\s+/g, ' ').trim();
+      
+      // Truncate if too long (Gemini 1.5 Flash has a large context window, but just in case)
+      if (scrapedText.length > 50000) {
+        scrapedText = scrapedText.substring(0, 50000);
+      }
+
+      // 3. Create placeholder entry
+      let newUid = 0;
+      setLorebook(prev => {
+        const entriesVal = Object.values(prev.entries) as LorebookEntry[];
+        const uids = entriesVal.map(e => e.uid);
+        newUid = uids.length > 0 ? Math.max(...uids) + 1 : 0;
+        
+        const newEntry: LorebookEntry = {
+           ...DEFAULT_ENTRY_TEMPLATE,
+           uid: newUid,
+           displayIndex: newUid,
+           comment: `Scraping: ${scrapeUrl}...`,
+           content: "Đang xử lý dữ liệu từ URL..."
+        };
+        return { ...prev, entries: { ...prev.entries, [newUid]: newEntry } };
+      });
+      setSelectedUid(newUid);
+
+      // 4. Generate content
+      const config = getApiConfig();
+      let mode: GenerationMode = 'brief';
+      let customTemplateContent: string | undefined = undefined;
+
+      if (selectedTemplateId === 'detailed') mode = 'detailed';
+      else if (selectedTemplateId === 'brief') mode = 'brief';
+      else {
+        const found = customTemplates.find(t => t.id === selectedTemplateId);
+        if (found) customTemplateContent = found.content;
+      }
+
+      const prompt = `Dựa vào thông tin được trích xuất từ Wiki sau đây, hãy tạo hồ sơ nhân vật. Nếu thông tin không đủ, hãy tự sáng tạo thêm cho phù hợp với ngữ cảnh.\n\nNguồn URL: ${scrapeUrl}\n\nNội dung trích xuất:\n${scrapedText}`;
+
+      const result = await generateLorebookEntry(
+          prompt, 
+          config, 
+          mode, 
+          customTemplateContent,
+          (streamedText) => {
+               setLorebook(prev => ({
+                  ...prev,
+                  entries: {
+                      ...prev.entries,
+                      [newUid]: {
+                          ...prev.entries[newUid],
+                          content: streamedText
+                      }
+                  }
+               }));
+          }
+      );
+
+      // 5. Update entry with final clean data
+      if (result) {
+         setLorebook(prev => {
+           const entry = prev.entries[newUid];
+           if(!entry) return prev;
+           return {
+             ...prev,
+             entries: {
+               ...prev.entries,
+               [newUid]: {
+                 ...entry,
+                 comment: result.comment && result.comment !== "Generated Character" ? result.comment : "Scraped Character",
+                 key: result.key && result.key.length > 0 ? result.key : ["Scraped Character"],
+                 content: result.content || "Failed to generate content"
+               }
+             }
+           }
+         });
+      }
+
+    } catch (e: any) {
+      setErrorMsg(`Scrape Error: ${e.message}`);
+    } finally {
+      setStatus(AppStatus.IDLE);
+      setIsScraping(false);
+    }
+  };
+
   // --- Render Helpers ---
   const entriesList = (Object.values(lorebook.entries) as LorebookEntry[])
     .sort((a, b) => (a.displayIndex || 0) - (b.displayIndex || 0))
@@ -606,6 +727,14 @@ const App: React.FC = () => {
                 icon={<svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M19 11H5m14 0a2 2 0 012 2v6a2 2 0 01-2 2H5a2 2 0 01-2-2v-6a2 2 0 012-2m14 0V9a2 2 0 00-2-2M5 11V9a2 2 0 012-2m0 0V5a2 2 0 012-2h6a2 2 0 012 2v2M7 7h10" /></svg>}
             >
               Batch Generate
+            </Button>
+            <Button 
+                onClick={() => setIsScrapeModalOpen(true)} 
+                variant="secondary" 
+                className="w-full !py-2 bg-green-600 hover:bg-green-700 text-white border-none" 
+                icon={<svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>}
+            >
+              Scrape from URL
             </Button>
           </div>
         </aside>
@@ -845,6 +974,43 @@ Role:
                 className="bg-purple-600 hover:bg-purple-700 text-white"
             >
                 Bắt đầu tạo ({batchQuantity})
+            </Button>
+          </div>
+        </div>
+      </Modal>
+
+      {/* Scrape Modal */}
+      <Modal
+        isOpen={isScrapeModalOpen}
+        onClose={() => setIsScrapeModalOpen(false)}
+        title="Scrape Character from URL"
+      >
+        <div className="space-y-4">
+          <div>
+            <label className="block text-sm font-medium text-gray-700 mb-1">Wiki/Fandom URL</label>
+            <input 
+              type="text"
+              value={scrapeUrl}
+              onChange={(e) => setScrapeUrl(e.target.value)}
+              className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-green-500 outline-none"
+              placeholder="https://highschooldxd.fandom.com/wiki/Schwertleite"
+            />
+          </div>
+          <div className="bg-green-50 p-4 rounded-lg text-sm text-green-800 border border-green-100">
+             <h4 className="font-semibold mb-1">Lưu ý:</h4>
+             <ul className="list-disc list-inside space-y-1">
+                <li>Hệ thống sẽ tự động trích xuất nội dung từ trang web.</li>
+                <li>AI sẽ sử dụng mẫu hồ sơ đang chọn ở màn hình chính để tạo nhân vật.</li>
+             </ul>
+          </div>
+          <div className="flex justify-end gap-3 pt-2">
+            <Button variant="secondary" onClick={() => setIsScrapeModalOpen(false)} disabled={isScraping}>Hủy</Button>
+            <Button 
+              onClick={handleScrapeGenerate} 
+              disabled={isScraping || !scrapeUrl}
+              className="bg-green-600 hover:bg-green-700 text-white border-none"
+            >
+              {isScraping ? <Spinner /> : "Scrape & Generate"}
             </Button>
           </div>
         </div>
