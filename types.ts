@@ -56,3 +56,8 @@ export enum AppStatus {
   SUCCESS = 'SUCCESS',
   ERROR = 'ERROR',
 }
+
+export interface FandomCharacterLink {
+  name: string;
+  url: string;
+}

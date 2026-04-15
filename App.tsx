@@ -1,6 +1,6 @@
 import React, { useState, useRef, useEffect } from 'react';
 import { generateLorebookEntry, generateCharacterList } from './services/geminiService';
-import { Lorebook, LorebookEntry, AppStatus, ApiProvider, ApiConfig, GenerationMode, LorebookTemplate } from './types';
+import { Lorebook, LorebookEntry, AppStatus, ApiProvider, ApiConfig, GenerationMode, LorebookTemplate, FandomCharacterLink } from './types';
 import { Spinner } from './components/Spinner';
 import { Button } from './components/Button';
 import { Modal } from './components/Modal';
@@ -170,6 +170,89 @@ const fetchWikiText = async (scrapeUrl: string): Promise<string> => {
   return text.substring(0, MAX_SCRAPED_TEXT_LENGTH);
 };
 
+// Helper: Fetch all character links from a Fandom/MediaWiki category page
+const fetchFandomCategoryLinks = async (categoryUrl: string): Promise<FandomCharacterLink[]> => {
+  // Strategy 1: MediaWiki API (preferred, no proxy needed)
+  const parsed = parseFandomUrl(categoryUrl);
+  if (parsed) {
+    const { apiBase } = parsed;
+    // Extract category title from URL path (e.g. "Category:Female_Characters")
+    try {
+      const u = new URL(categoryUrl);
+      const pathParts = u.pathname.replace(/^\/wiki\//, '');
+      const categoryTitle = decodeURIComponent(pathParts);
+      const base = `${u.protocol}//${u.host}`;
+
+      const allLinks: FandomCharacterLink[] = [];
+      let cmcontinue: string | undefined = undefined;
+      const MAX_PAGES = 3;
+
+      for (let page = 0; page < MAX_PAGES; page++) {
+        const params = new URLSearchParams({
+          action: 'query',
+          list: 'categorymembers',
+          cmtitle: categoryTitle,
+          cmtype: 'page',
+          cmlimit: '500',
+          format: 'json',
+          origin: '*',
+        });
+        if (cmcontinue) params.set('cmcontinue', cmcontinue);
+
+        const res = await fetch(`${apiBase}?${params}`);
+        if (!res.ok) throw new Error(`API response: ${res.status}`);
+        const data = await res.json();
+
+        const members: any[] = data.query?.categorymembers || [];
+        for (const m of members) {
+          allLinks.push({
+            name: m.title,
+            url: `${base}/wiki/${encodeURIComponent(m.title.replace(/ /g, '_'))}`,
+          });
+        }
+
+        cmcontinue = data.continue?.cmcontinue;
+        if (!cmcontinue) break;
+      }
+
+      if (allLinks.length > 0) return allLinks;
+    } catch {
+      // fall through to proxy
+    }
+  }
+
+  // Strategy 2: HTML scraping via allorigins.win proxy (fallback)
+  const proxyUrl = `https://api.allorigins.win/get?url=${encodeURIComponent(categoryUrl)}`;
+  const proxyRes = await fetch(proxyUrl);
+  if (!proxyRes.ok) throw new Error('Failed to fetch category page via proxy.');
+  const proxyData = await proxyRes.json();
+  const html: string = proxyData.contents || '';
+
+  const parser = new DOMParser();
+  const doc = parser.parseFromString(html, 'text/html');
+
+  const baseUrl = (() => {
+    try {
+      const u = new URL(categoryUrl);
+      return `${u.protocol}//${u.host}`;
+    } catch { return ''; }
+  })();
+
+  const anchors = Array.from(
+    doc.querySelectorAll('.category-page__members a[href^="/wiki/"], #mw-pages a[href^="/wiki/"]')
+  ) as HTMLAnchorElement[];
+
+  const links: FandomCharacterLink[] = anchors
+    .filter(a => !a.getAttribute('href')!.includes(':'))
+    .map(a => ({
+      name: (a.textContent || '').trim(),
+      url: `${baseUrl}${a.getAttribute('href')}`,
+    }))
+    .filter(l => l.name.length > 0);
+
+  return links;
+};
+
 const App: React.FC = () => {
   // --- Data State ---
   const [lorebook, setLorebook] = useState<Lorebook>({ entries: {} });
@@ -207,6 +290,16 @@ const App: React.FC = () => {
   const [isScrapeModalOpen, setIsScrapeModalOpen] = useState(false);
   const [scrapeUrl, setScrapeUrl] = useState("");
   const [isScraping, setIsScraping] = useState(false);
+
+  // --- Fandom Category Scraper State ---
+  const [isFandomModalOpen, setIsFandomModalOpen] = useState(false);
+  const [fandomCategoryUrl, setFandomCategoryUrl] = useState("");
+  const [isFetchingCategory, setIsFetchingCategory] = useState(false);
+  const [fandomCharacterLinks, setFandomCharacterLinks] = useState<FandomCharacterLink[]>([]);
+  const [selectedFandomLinks, setSelectedFandomLinks] = useState<Set<string>>(new Set());
+  const [fandomStep, setFandomStep] = useState<'input' | 'select' | 'generating'>('input');
+  const [fandomProgress, setFandomProgress] = useState({ current: 0, total: 0, currentName: '' });
+  const [fandomSearchQuery, setFandomSearchQuery] = useState("");
 
   // --- API Configuration State (Persistent) ---
   const [apiProvider, setApiProvider] = useState<ApiProvider>(() => 
@@ -714,7 +807,127 @@ ${scrapedText}
     }
   };
 
-  // --- Render Helpers ---
+  // --- Fandom Category Scraper Handlers ---
+  const handleFetchCategory = async () => {
+    if (!fandomCategoryUrl.trim()) return;
+    setIsFetchingCategory(true);
+    setFandomCharacterLinks([]);
+    setSelectedFandomLinks(new Set());
+    setFandomSearchQuery("");
+    try {
+      const links = await fetchFandomCategoryLinks(fandomCategoryUrl);
+      if (links.length === 0) throw new Error("No characters found in this category.");
+      setFandomCharacterLinks(links);
+      setFandomStep('select');
+    } catch (e: any) {
+      setErrorMsg(`Category Error: ${e.message}`);
+    } finally {
+      setIsFetchingCategory(false);
+    }
+  };
+
+  const handleSelectAll = () => setSelectedFandomLinks(new Set(fandomCharacterLinks.map(l => l.url)));
+  const handleDeselectAll = () => setSelectedFandomLinks(new Set());
+  const toggleFandomLink = (url: string) => {
+    setSelectedFandomLinks(prev => {
+      const next = new Set(prev);
+      if (next.has(url)) next.delete(url); else next.add(url);
+      return next;
+    });
+  };
+
+  const handleFandomBatchGenerate = async () => {
+    const linksToProcess = fandomCharacterLinks.filter(l => selectedFandomLinks.has(l.url));
+    if (linksToProcess.length === 0) return;
+    if (apiProvider === 'custom' && !isApiConnected) return setErrorMsg('Connect to Custom API first');
+
+    setFandomStep('generating');
+    setFandomProgress({ current: 0, total: linksToProcess.length, currentName: '' });
+    setErrorMsg(null);
+
+    let mode: GenerationMode = 'brief';
+    let customTemplateContent: string | undefined = undefined;
+    if (selectedTemplateId === 'detailed') mode = 'detailed';
+    else if (selectedTemplateId !== 'brief') {
+      const found = customTemplates.find(t => t.id === selectedTemplateId);
+      if (found) customTemplateContent = found.content;
+    }
+
+    const config = getApiConfig();
+
+    for (let i = 0; i < linksToProcess.length; i++) {
+      const link = linksToProcess[i];
+      setFandomProgress({ current: i + 1, total: linksToProcess.length, currentName: link.name });
+
+      try {
+        const scrapedText = await fetchWikiText(link.url);
+
+        // Compute newUid synchronously from current lorebook state
+        let newUid = 0;
+        setLorebook(prev => {
+          const uids = (Object.values(prev.entries) as LorebookEntry[]).map(e => e.uid);
+          newUid = uids.length > 0 ? Math.max(...uids) + 1 : 0;
+          return {
+            ...prev,
+            entries: {
+              ...prev.entries,
+              [newUid]: {
+                ...DEFAULT_ENTRY_TEMPLATE,
+                uid: newUid,
+                displayIndex: newUid,
+                comment: `Generating: ${link.name}...`,
+                content: 'Đang xử lý...',
+              }
+            }
+          };
+        });
+
+        // Wait a tick for state to settle
+        await new Promise(r => setTimeout(r, 50));
+
+        const prompt = `Dựa vào thông tin được trích xuất từ Wiki sau đây, hãy tạo hồ sơ nhân vật.\n\nURL: ${link.url}\n\n---NỘI DUNG WIKI---\n${scrapedText}\n---KẾT THÚC NỘI DUNG---`;
+
+        const capturedUid = newUid;
+        const result = await generateLorebookEntry(prompt, config, mode, customTemplateContent, (streamedText) => {
+          setLorebook(prev => ({
+            ...prev,
+            entries: {
+              ...prev.entries,
+              [capturedUid]: { ...prev.entries[capturedUid], content: streamedText }
+            }
+          }));
+        });
+
+        if (result) {
+          setLorebook(prev => {
+            const entry = prev.entries[capturedUid];
+            if (!entry) return prev;
+            return {
+              ...prev,
+              entries: {
+                ...prev.entries,
+                [capturedUid]: {
+                  ...entry,
+                  comment: (result.comment && result.comment !== 'Generated Character') ? result.comment : link.name,
+                  key: (result.key && result.key.length > 0) ? result.key : [link.name],
+                  content: result.content || 'Failed to generate content',
+                }
+              }
+            };
+          });
+        }
+      } catch (e: any) {
+        setErrorMsg(`Error processing ${link.name}: ${e.message}`);
+        await new Promise(r => setTimeout(r, 1000));
+      }
+    }
+
+    setFandomStep('input');
+    setIsFandomModalOpen(false);
+    setFandomCharacterLinks([]);
+    setSelectedFandomLinks(new Set());
+    setFandomCategoryUrl('');
+  };
   const entriesList = (Object.values(lorebook.entries) as LorebookEntry[])
     .sort((a, b) => (a.displayIndex || 0) - (b.displayIndex || 0))
     .filter(e => e.comment.toLowerCase().includes(searchQuery.toLowerCase()) || e.content.toLowerCase().includes(searchQuery.toLowerCase()));
@@ -873,6 +1086,14 @@ ${scrapedText}
                 icon={<svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M13.828 10.172a4 4 0 00-5.656 0l-4 4a4 4 0 105.656 5.656l1.102-1.101m-.758-4.899a4 4 0 005.656 0l4-4a4 4 0 00-5.656-5.656l-1.1 1.1" /></svg>}
             >
               Scrape from URL
+            </Button>
+            <Button 
+                onClick={() => { setIsFandomModalOpen(true); setFandomStep('input'); }}
+                variant="secondary" 
+                className="w-full !py-2 bg-orange-500 hover:bg-orange-600 text-white border-none" 
+                icon={<svg className="w-4 h-4" fill="none" viewBox="0 0 24 24" stroke="currentColor"><path strokeLinecap="round" strokeLinejoin="round" strokeWidth={2} d="M4 6h16M4 10h16M4 14h10M4 18h6" /></svg>}
+            >
+              Fandom Category
             </Button>
           </div>
         </aside>
@@ -1152,6 +1373,114 @@ Role:
             </Button>
           </div>
         </div>
+      </Modal>
+
+      {/* Fandom Category Scraper Modal */}
+      <Modal
+        isOpen={isFandomModalOpen}
+        onClose={() => fandomStep !== 'generating' && setIsFandomModalOpen(false)}
+        title={
+          fandomStep === 'input' ? 'Fandom Category Scraper' :
+          fandomStep === 'select' ? `Chọn nhân vật (${fandomCharacterLinks.length} tìm thấy)` :
+          'Đang tạo hồ sơ hàng loạt...'
+        }
+      >
+        {fandomStep === 'input' && (
+          <div className="space-y-4">
+            <div>
+              <label className="block text-sm font-medium text-gray-700 mb-1">URL Trang Danh Mục (Category)</label>
+              <input
+                type="text"
+                value={fandomCategoryUrl}
+                onChange={(e) => setFandomCategoryUrl(e.target.value)}
+                className="w-full p-3 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none"
+                placeholder="https://highschooldxd.fandom.com/wiki/Category:Female_Characters"
+              />
+            </div>
+            <div className="bg-orange-50 p-4 rounded-lg text-sm text-orange-800 border border-orange-100">
+              <h4 className="font-semibold mb-1">Hướng dẫn:</h4>
+              <ol className="list-decimal list-inside space-y-1">
+                <li>Nhập URL trang Category từ Fandom hoặc Wiki bất kỳ.</li>
+                <li>Hệ thống sẽ tự trích xuất danh sách nhân vật.</li>
+                <li>Chọn nhân vật cần tạo hồ sơ và nhấn Bắt đầu.</li>
+              </ol>
+            </div>
+            <div className="flex justify-end gap-3">
+              <Button variant="secondary" onClick={() => setIsFandomModalOpen(false)}>Hủy</Button>
+              <Button
+                onClick={handleFetchCategory}
+                disabled={isFetchingCategory || !fandomCategoryUrl}
+                className="bg-orange-500 hover:bg-orange-600 text-white border-none"
+              >
+                {isFetchingCategory ? <><Spinner /> Đang tải...</> : 'Lấy danh sách'}
+              </Button>
+            </div>
+          </div>
+        )}
+
+        {fandomStep === 'select' && (
+          <div className="space-y-4">
+            <p className="text-sm text-gray-600">Tìm thấy <strong>{fandomCharacterLinks.length}</strong> nhân vật - Chọn các nhân vật cần tạo hồ sơ</p>
+            <div className="flex gap-2">
+              <button onClick={handleSelectAll} className="text-xs px-3 py-1.5 bg-orange-100 text-orange-700 rounded-lg hover:bg-orange-200 transition-colors">Chọn tất cả</button>
+              <button onClick={handleDeselectAll} className="text-xs px-3 py-1.5 bg-gray-100 text-gray-600 rounded-lg hover:bg-gray-200 transition-colors">Bỏ chọn tất cả</button>
+            </div>
+            <input
+              type="text"
+              placeholder="Tìm kiếm nhân vật..."
+              value={fandomSearchQuery}
+              onChange={(e) => setFandomSearchQuery(e.target.value)}
+              className="w-full p-2 border border-gray-300 rounded-lg focus:ring-2 focus:ring-orange-500 outline-none text-sm"
+            />
+            <div className="max-h-80 overflow-y-auto border border-gray-200 rounded-lg divide-y divide-gray-100">
+              {fandomCharacterLinks
+                .filter(l => l.name.toLowerCase().includes(fandomSearchQuery.toLowerCase()))
+                .map(link => (
+                  <label key={link.url} className="flex items-center gap-3 px-4 py-2.5 hover:bg-orange-50 cursor-pointer transition-colors">
+                    <input
+                      type="checkbox"
+                      checked={selectedFandomLinks.has(link.url)}
+                      onChange={() => toggleFandomLink(link.url)}
+                      className="w-4 h-4 accent-orange-500 cursor-pointer"
+                    />
+                    <span className="text-sm text-gray-800">{link.name}</span>
+                  </label>
+                ))
+              }
+            </div>
+            <div className="flex justify-between items-center pt-1">
+              <span className="text-sm text-gray-500">Đã chọn: <strong>{selectedFandomLinks.size}</strong></span>
+              <div className="flex gap-3">
+                <Button variant="secondary" onClick={() => setFandomStep('input')}>Quay lại</Button>
+                <Button
+                  onClick={handleFandomBatchGenerate}
+                  disabled={selectedFandomLinks.size === 0}
+                  className="bg-orange-500 hover:bg-orange-600 text-white border-none"
+                >
+                  Bắt đầu tạo ({selectedFandomLinks.size})
+                </Button>
+              </div>
+            </div>
+          </div>
+        )}
+
+        {fandomStep === 'generating' && (
+          <div className="space-y-6 py-4">
+            <div>
+              <div className="flex justify-between text-sm text-gray-600 mb-2">
+                <span>Đang xử lý: <strong>{fandomProgress.currentName}</strong></span>
+                <span>{fandomProgress.current}/{fandomProgress.total}</span>
+              </div>
+              <div className="w-full bg-gray-200 rounded-full h-3 overflow-hidden">
+                <div
+                  className="bg-orange-500 h-3 rounded-full transition-all duration-500"
+                  style={{ width: fandomProgress.total > 0 ? `${(fandomProgress.current / fandomProgress.total) * 100}%` : '0%' }}
+                />
+              </div>
+            </div>
+            <p className="text-center text-sm text-gray-500">Vui lòng không đóng cửa sổ này trong quá trình tạo hồ sơ.</p>
+          </div>
+        )}
       </Modal>
 
     </div>
