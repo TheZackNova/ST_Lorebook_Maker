@@ -109,13 +109,15 @@ const fetchWikiText = async (scrapeUrl: string): Promise<string> => {
         const parseData = await parseRes.json();
         const wikitext: string = parseData.parse?.wikitext?.['*'] || '';
         if (wikitext.length > MIN_API_EXTRACT_LENGTH) {
-          // Iteratively remove {{templates}} until fully resolved (handles deep nesting)
+          // Iteratively remove {{templates}} until fully resolved (handles deep nesting, capped for safety)
           let t = wikitext;
           let prev: string;
+          let iterations = 0;
           do {
             prev = t;
             t = t.replace(/\{\{[^{}]*\}\}/g, '');
-          } while (t !== prev);
+            iterations++;
+          } while (t !== prev && iterations < 20);
           const cleanText = new DOMParser()
             .parseFromString(
               t
